@@ -1,8 +1,11 @@
 from datetime import timedelta
+from importlib import reload
 from unittest.mock import MagicMock, patch
 
+from django.conf import settings
 from django.contrib.auth import get_user_model
-from django.test import TestCase
+from django.core import exceptions as django_exceptions
+from django.test import TestCase, override_settings
 from rest_framework import exceptions as drf_exceptions
 
 from rest_framework_simplejwt.exceptions import TokenError
@@ -76,6 +79,17 @@ class TestTokenObtainSerializer(TestCase):
         with self.assertRaises(drf_exceptions.AuthenticationFailed):
             s.is_valid()
 
+    def test_it_should_pass_validate_if_request_not_in_context(self):
+        s = TokenObtainSerializer(
+            context={},
+            data={
+                "username": self.username,
+                "password": self.password,
+            },
+        )
+
+        s.is_valid()
+
     def test_it_should_raise_if_user_not_active(self):
         self.user.is_active = False
         self.user.save()
@@ -90,6 +104,29 @@ class TestTokenObtainSerializer(TestCase):
 
         with self.assertRaises(drf_exceptions.AuthenticationFailed):
             s.is_valid()
+
+    @override_settings(
+        AUTHENTICATION_BACKENDS=[
+            "django.contrib.auth.backends.AllowAllUsersModelBackend",
+            "django.contrib.auth.backends.ModelBackend",
+        ]
+    )
+    @override_api_settings(
+        CHECK_USER_IS_ACTIVE=False,
+    )
+    def test_it_should_validate_if_user_inactive_but_rule_allows(self):
+        self.user.is_active = False
+        self.user.save()
+
+        s = TokenObtainSerializer(
+            context=MagicMock(),
+            data={
+                TokenObtainSerializer.username_field: self.username,
+                "password": self.password,
+            },
+        )
+
+        self.assertTrue(s.is_valid())
 
 
 class TestTokenObtainSlidingSerializer(TestCase):
@@ -169,7 +206,7 @@ class TestTokenRefreshSlidingSerializer(TestCase):
         with self.assertRaises(TokenError) as e:
             s.is_valid()
 
-        self.assertIn("invalid or expired", e.exception.args[0])
+        self.assertIn("expired", e.exception.args[0])
 
     def test_it_should_raise_token_error_if_token_has_no_refresh_exp_claim(self):
         token = SlidingToken()
@@ -234,6 +271,54 @@ class TestTokenRefreshSlidingSerializer(TestCase):
 
 
 class TestTokenRefreshSerializer(TestCase):
+    def setUp(self):
+        self.username = "test_user"
+        self.password = "test_password"
+
+        self.user = User.objects.create_user(
+            username=self.username,
+            password=self.password,
+        )
+
+    def test_it_should_raise_error_for_deleted_users(self):
+        refresh = RefreshToken.for_user(self.user)
+        self.user.delete()
+
+        s = TokenRefreshSerializer(data={"refresh": str(refresh)})
+
+        with self.assertRaises(django_exceptions.ObjectDoesNotExist) as e:
+            s.is_valid()
+
+        self.assertIn("does not exist", str(e.exception))
+
+    def test_it_should_raise_error_for_inactive_users(self):
+        refresh = RefreshToken.for_user(self.user)
+        self.user.is_active = False
+        self.user.save()
+
+        s = TokenRefreshSerializer(data={"refresh": str(refresh)})
+
+        with self.assertRaises(drf_exceptions.AuthenticationFailed) as e:
+            s.is_valid()
+
+        self.assertIn("No active account", e.exception.args[0])
+
+    def test_it_should_return_access_token_for_active_users(self):
+        refresh = RefreshToken.for_user(self.user)
+
+        s = TokenRefreshSerializer(data={"refresh": str(refresh)})
+
+        now = aware_utcnow() - api_settings.ACCESS_TOKEN_LIFETIME / 2
+        with patch("rest_framework_simplejwt.tokens.aware_utcnow") as fake_aware_utcnow:
+            fake_aware_utcnow.return_value = now
+            s.is_valid()
+
+        access = AccessToken(s.validated_data["access"])
+
+        self.assertEqual(
+            access["exp"], datetime_to_epoch(now + api_settings.ACCESS_TOKEN_LIFETIME)
+        )
+
     def test_it_should_raise_token_error_if_token_invalid(self):
         token = RefreshToken()
         del token["exp"]
@@ -252,7 +337,7 @@ class TestTokenRefreshSerializer(TestCase):
         with self.assertRaises(TokenError) as e:
             s.is_valid()
 
-        self.assertIn("invalid or expired", e.exception.args[0])
+        self.assertIn("expired", e.exception.args[0])
 
     def test_it_should_raise_token_error_if_token_has_wrong_type(self):
         token = RefreshToken()
@@ -372,6 +457,32 @@ class TestTokenRefreshSerializer(TestCase):
         # Assert old refresh token is blacklisted
         self.assertEqual(BlacklistedToken.objects.first().token.jti, old_jti)
 
+    @override_api_settings(
+        ROTATE_REFRESH_TOKENS=True,
+        BLACKLIST_AFTER_ROTATION=True,
+    )
+    def test_blacklist_app_not_installed_should_pass(self):
+        from rest_framework_simplejwt import serializers, tokens
+
+        # Remove blacklist app
+        new_apps = list(settings.INSTALLED_APPS)
+        new_apps.remove("rest_framework_simplejwt.token_blacklist")
+
+        with self.settings(INSTALLED_APPS=tuple(new_apps)):
+            # Reload module that blacklist app not installed
+            reload(tokens)
+            reload(serializers)
+
+            refresh = tokens.RefreshToken()
+
+            # Serializer validates
+            ser = serializers.TokenRefreshSerializer(data={"refresh": str(refresh)})
+            ser.validate({"refresh": str(refresh)})
+
+        # Restore origin module without mock
+        reload(tokens)
+        reload(serializers)
+
 
 class TestTokenVerifySerializer(TestCase):
     def test_it_should_raise_token_error_if_token_invalid(self):
@@ -392,7 +503,7 @@ class TestTokenVerifySerializer(TestCase):
         with self.assertRaises(TokenError) as e:
             s.is_valid()
 
-        self.assertIn("invalid or expired", e.exception.args[0])
+        self.assertIn("expired", e.exception.args[0])
 
     def test_it_should_not_raise_token_error_if_token_has_wrong_type(self):
         token = RefreshToken()
@@ -437,7 +548,7 @@ class TestTokenBlacklistSerializer(TestCase):
         with self.assertRaises(TokenError) as e:
             s.is_valid()
 
-        self.assertIn("invalid or expired", e.exception.args[0])
+        self.assertIn("expired", e.exception.args[0])
 
     def test_it_should_raise_token_error_if_token_has_wrong_type(self):
         token = RefreshToken()
@@ -489,3 +600,25 @@ class TestTokenBlacklistSerializer(TestCase):
 
         # Assert old refresh token is blacklisted
         self.assertEqual(BlacklistedToken.objects.first().token.jti, old_jti)
+
+    def test_blacklist_app_not_installed_should_pass(self):
+        from rest_framework_simplejwt import serializers, tokens
+
+        # Remove blacklist app
+        new_apps = list(settings.INSTALLED_APPS)
+        new_apps.remove("rest_framework_simplejwt.token_blacklist")
+
+        with self.settings(INSTALLED_APPS=tuple(new_apps)):
+            # Reload module that blacklist app not installed
+            reload(tokens)
+            reload(serializers)
+
+            refresh = tokens.RefreshToken()
+
+            # Serializer validates
+            ser = serializers.TokenBlacklistSerializer(data={"refresh": str(refresh)})
+            ser.validate({"refresh": str(refresh)})
+
+        # Restore origin module without mock
+        reload(tokens)
+        reload(serializers)
