@@ -1,13 +1,18 @@
 import json
 from collections.abc import Iterable
 from datetime import timedelta
-from typing import Any, Dict, Optional, Type, Union
+from typing import Any, Optional, Union
 
 import jwt
 from django.utils.translation import gettext_lazy as _
-from jwt import InvalidAlgorithmError, InvalidTokenError, algorithms
+from jwt import (
+    ExpiredSignatureError,
+    InvalidAlgorithmError,
+    InvalidTokenError,
+    algorithms,
+)
 
-from .exceptions import TokenBackendError
+from .exceptions import TokenBackendError, TokenBackendExpiredToken
 from .tokens import Token
 from .utils import format_lazy
 
@@ -28,7 +33,7 @@ ALLOWED_ALGORITHMS = {
     "ES256",
     "ES384",
     "ES512",
-}
+}.union(algorithms.requires_cryptography)
 
 
 class TokenBackend:
@@ -41,7 +46,7 @@ class TokenBackend:
         issuer: Optional[str] = None,
         jwk_url: Optional[str] = None,
         leeway: Union[float, int, timedelta, None] = None,
-        json_encoder: Optional[Type[json.JSONEncoder]] = None,
+        json_encoder: Optional[type[json.JSONEncoder]] = None,
     ) -> None:
         self._validate_algorithm(algorithm)
 
@@ -101,11 +106,11 @@ class TokenBackend:
             try:
                 return self.jwks_client.get_signing_key_from_jwt(token).key
             except PyJWKClientError as ex:
-                raise TokenBackendError(_("Token is invalid or expired")) from ex
+                raise TokenBackendError(_("Token is invalid")) from ex
 
         return self.verifying_key
 
-    def encode(self, payload: Dict[str, Any]) -> str:
+    def encode(self, payload: dict[str, Any]) -> str:
         """
         Returns an encoded token for the given payload dictionary.
         """
@@ -127,7 +132,7 @@ class TokenBackend:
         # For PyJWT >= 2.0.0a1
         return token
 
-    def decode(self, token: Token, verify: bool = True) -> Dict[str, Any]:
+    def decode(self, token: Token, verify: bool = True) -> dict[str, Any]:
         """
         Performs a validation of the given token and returns its payload
         dictionary.
@@ -150,5 +155,7 @@ class TokenBackend:
             )
         except InvalidAlgorithmError as ex:
             raise TokenBackendError(_("Invalid algorithm specified")) from ex
+        except ExpiredSignatureError as ex:
+            raise TokenBackendExpiredToken(_("Token is expired")) from ex
         except InvalidTokenError as ex:
-            raise TokenBackendError(_("Token is invalid or expired")) from ex
+            raise TokenBackendError(_("Token is invalid")) from ex
